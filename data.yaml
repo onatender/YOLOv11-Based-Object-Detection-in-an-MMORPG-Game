@@ -1,0 +1,6 @@
+path: 'c:/Users/onate/Desktop/Dosyalar/burahileyazmaolayi/yolo_train'
+train: 'images/train'
+val: 'images/train'
+
+nc: 2
+names: ['objects', 'metin']
