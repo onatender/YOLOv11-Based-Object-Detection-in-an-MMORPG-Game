@@ -84,12 +84,22 @@ with open('data.yaml', 'w', encoding='utf-8') as f:
 print("✅ Format dönüşümü başarılı! Eğitime geçiliyor...")
 
 if __name__ == '__main__':
-    # Eğitim İşlemini Bizzat Başlatalım! (Hızlı, yeni bir Nano model ile)
-    print("🚀 Yapay Zeka Beyni Eğitimi (YOLOv8 Nano) Başlatılıyor...")
-    # Sadece 30 tur eğitim (epochs) yapacağız ki bilgisayar fazla beklemesin.
-    model = YOLO('yolov8n.pt') 
+    # Yeni ve Daha Güçlü YOLOv11 Eğitimi
+    print("🚀 Daha Güçlü Yapay Zeka Beyni Eğitimi (YOLO11 Nano) Başlatılıyor...")
+    # Modelimizi YOLOv11'e yükseltiyoruz
+    # Epochs=150: Daha fazla tur atarak modelin uzmanlaşmasını sağlar.
+    # Imgsz=1024: Uzaktaki küçük taşları daha iyi tanıması için yüksek çözünürlükte eğitilir.
+    model = YOLO('yolo11n.pt') 
     
-    # workers=0 ayarı Windows'ta 'DataLoader worker exited unexpectedly' hatasını engeller!
-    results = model.train(data='data.yaml', epochs=30, imgsz=640, batch=4, workers=0)
+    # patience=50: Eğer model 50 tur boyunca gelişmezse eğitimi akıllıca bitirir.
+    results = model.train(
+        data='data.yaml', 
+        epochs=150, 
+        imgsz=1024, 
+        batch=-1,    # RTX 3050'nin belleğine göre otomatik en iyi batch size'ı seçer
+        workers=0, 
+        patience=50,
+        device=0     # Ekran kartınızı (GPU) kullanır
+    )
 
-    print("🎯 MÜKEMMEL! Eğitim başarıyla bitti! Yeni oluşan '.pt' modeli artık kullanılmaya hazır, o klasörü kontrol edin.")
+    print("🎯 MÜKEMMEL! Güçlendirilmiş eğitim başarıyla bitti! Yeni oluşan '.pt' modeli artık çok daha isabetli çalışacak.")

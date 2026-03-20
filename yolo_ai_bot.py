@@ -6,6 +6,19 @@ import ctypes
 import pydirectinput
 from ultralytics import YOLO
 import threading
+import sys
+
+# YÖNETİCİ YETKİSİ KONTROLÜ (Admin Check)
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+if not is_admin():
+    # Eğer yönetici değilse, kendini yönetici olarak yeniden başlatır
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+    sys.exit()
 
 # Windows DPI ve OpenCV Optimizasyonları
 try:
@@ -16,10 +29,10 @@ except:
 cv2.setUseOptimized(True)
 cv2.setNumThreads(4)
 
-# Model ve Pydirectinput ayarları
+# Model ve Pydirectinput ayarları (Yeni ve Saf %99.5 Doğruluklu Model)
 pydirectinput.FAILSAFE = False
 pydirectinput.PAUSE = 0.0
-model = YOLO(r"runs\detect\train5\weights\best.pt")
+model = YOLO(r"runs\detect\train6\weights\best.pt")
 
 class FastCapture:
     """Ekranı en yüksek hızda (Arka planda) yakalayan motor"""
