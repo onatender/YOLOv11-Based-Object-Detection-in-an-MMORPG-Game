@@ -25,11 +25,12 @@ if not is_admin():
     sys.exit()
 
 pydirectinput.FAILSAFE = False # Kilitleri kapat
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(1)
-except Exception:
-    try: ctypes.windll.user32.SetProcessDPIAware()
-    except: pass
+# DPI Farkındalığı (Qt 6 varsayılan olarak yönetir, manuel ayar bazen çakışma yaratır)
+# try:
+#     ctypes.windll.shcore.SetProcessDpiAwareness(1)
+# except Exception:
+#     try: ctypes.windll.user32.SetProcessDPIAware()
+#     except: pass
 
 class BotWorker(QThread):
     update_frame = pyqtSignal(np.ndarray)
@@ -60,15 +61,28 @@ class BotWorker(QThread):
         self.conf_threshold = 0.60 # Varsayılan güven eşiği: %60
         self.is_enemy_dead = 0 # 0: Yok, 1: Canlı, 2: Ölü
         self.max_fov = 10000.0 # Varsayılan Max FOV değeri
-        self.show_preview = False # 🚀 KESİN KAPALI BAŞLAT
+        self.show_preview = False 
         self.template = cv2.imread("search_for.png") if os.path.exists("search_for.png") else None
         
-        # Zamanlayıcılar
+        # Zamanlayıcılar ve Durum Yönetimi
         self.last_f_time = time.time()
-        self.f_state = False # False: Bırakıldı, True: Basıldı
-        self.last_ui_time = 0.0 # UI güncelleme zamanlayıcısı
+        self.f_state = False 
+        self.last_ui_time = 0.0 
         self.last_action_time = time.time()
         self.last_state = "IDLE"
+        self.last_logged_msg = ""
+        self.search_start_time = 0.0
+        self.stuck_cooldown = 0.0
+        self.atk_confirm_count = 0
+        self.static_duration = 0.0
+        self.last_frame_time = time.time()
+
+    def smart_log(self, msg):
+        """Aynı logun tekrar etmesini önleyerek temiz çıktı sağlar."""
+        if msg != self.last_logged_msg:
+            # UI loguna gönder
+            self.update_log.emit(msg)
+            self.last_logged_msg = msg
 
     def _memory_scanner(self):
         """Merkezi self.helper Üzerinden Bellek Tarayıcı"""
@@ -118,25 +132,29 @@ class BotWorker(QThread):
                         else: self.locked_vid = 0; self.sel_vid = 0
                     else: self.sel_vid = 0
 
-                # 6. Attack VID ([0x039103B8]+0x4C)
+                # 6. Attack VID ([0x039103B8]+0x4C) - DOĞRUDAN OKUMA
+                # 6. Attack VID ([0x039103B8]+0x4C) - HAM VERİ OKUMA
                 ptr_atk_target = self.helper.resolve_pointer(0x039103B8, [0x4C])
                 if ptr_atk_target: 
-                    self.atk_vid = self.helper.read_uint(ptr_atk_target)
-                    # Seçili hedef canlıysa AtkVID'ye yazmaya devam et
+                    # 🚀 Hayalet Saldırı: Sadece canlı metne seçiliysek hafızaya YAZ
                     if self.autopilot and self.sel_vid > 0 and self.is_enemy_dead == 1:
-                        if self.atk_vid != self.sel_vid:
+                        if self.helper.read_uint(ptr_atk_target) != self.sel_vid:
                             self.helper.write_uint(ptr_atk_target, self.sel_vid)
-                            self.atk_vid = self.sel_vid
-                    elif self.is_enemy_dead == 2:
-                        self.atk_vid = 0
+                    
+                    # 🎯 SON DURUMU HER ZAMAN OKU (Filtresiz)
+                    self.atk_vid = self.helper.read_uint(ptr_atk_target)
+                
+                # ❗ MANUEL SIFIRLAMALAR KALDIRILDI - Hafıza ne diyorsa o!
                 
                 # 7. Anlık FOV (setFov) [[[Base+039195F8]+0]+14]+134
                 ptr_fov_set = self.helper.resolve_pointer(0x039195F8, [0, 0x14, 0x134])
                 if ptr_fov_set:
                     self.curr_fov = self.helper.read_float(ptr_fov_set)
-                    # Sabitleme devredeyse HER ZAMAN yaz (Autopilot bekleme)
                     if self.auto_fov_enabled:
                         self.helper.write_float(ptr_fov_set, self.target_fov)
+
+                # 🚀 ANLIK SİNYAL: Bellek verilerini görüntüyü beklemeden saniyede 100 kez Dashboard'a gönder
+                self.update_data.emit(self.curr_x, self.curr_y, float(self.mem_is_attacking), self.curr_name, self.sel_vid, self.atk_vid, self.is_enemy_dead, self.curr_fov)
             except: pass
             time.sleep(0.01)
 
@@ -168,6 +186,7 @@ class BotWorker(QThread):
                 frame = np.frombuffer(sct_img.bgra, dtype=np.uint8).reshape(sct_img.height, sct_img.width, 4)
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                 
+                # YOLO MODELLERİYLE HEDEF TESPİTİ
                 results = self.model(frame, conf=self.conf_threshold, device='0', half=True, imgsz=640, verbose=False)
                 targets = []
                 for r in results:
@@ -176,11 +195,12 @@ class BotWorker(QThread):
                         cx, cy_mid = int((x1+x2)/2), int((y1+y2)/2)
                         targets.append((cx, cy_mid))
                         cv2.circle(frame, (cx, cy_mid), int(max(x2-x1, y2-y1)/1.6), (0, 0, 255), 2)
+                
+                is_empty = len(targets) == 0
 
-                # UI GÜNCELLEME
+                # UI GÜNCELLEME (Sadece Görüntü)
                 if now - self.last_ui_time > 0.04:
                     if self.show_preview: self.update_frame.emit(frame)
-                    self.update_data.emit(self.curr_x, self.curr_y, float(self.mem_is_attacking), self.curr_name, self.sel_vid, self.atk_vid, self.is_enemy_dead, self.curr_fov)
                     self.last_ui_time = now
                 
                 if not self.autopilot:
@@ -188,55 +208,75 @@ class BotWorker(QThread):
                     time.sleep(0.01); continue
                 
                 # --- OTONOM BOT MANTIĞI ---
-                is_empty = len(targets) == 0
-                is_static = abs(self.curr_x - self.last_x) < 0.001
-
-                # 1. STUCK RECOVERY (Mücadele Öncelikli)
-                # 🛡️ SİZİN ŞARTINIZ: SelVid!=0, AtkVid!=0, ATK=0, CANLI ve 1 saniyedir hareketsizlik
-                is_really_stuck = is_static and (self.sel_vid != 0) and (self.atk_vid != 0) and \
-                                 (self.mem_is_attacking == 0) and (self.is_enemy_dead == 1)
+                # 1. HAREKETLİLİK VE SIKIŞMA TAKİBİ
+                is_static = abs(self.curr_x - self.last_x) < 0.01 # Hassasiyeti biraz düşürdük
+                if is_static:
+                    self.static_duration += (now - self.last_frame_time)
+                else:
+                    self.static_duration = 0.0
                 
-                if is_really_stuck and (now - self.last_action_time > 1.0):
-                    actions = ['space', 's', 'a', 'd']
-                    key = actions[self.stuck_retry_count % len(actions)]
-                    self.update_log.emit(f"⚠️ Yol Engeli! Hamle: {key.upper()}")
-                    pydirectinput.keyDown(key); time.sleep(0.5); pydirectinput.keyUp(key)
-                    pydirectinput.press('3'); self.stuck_retry_count += 1
-                    self.last_action_time = now; self.last_state = "IDLE"; continue
+                # 2. STUCK RECOVERY (HEDEF VARKEN HAREKET EDEMEME)
+                # 'Gidiliyor' durumunda 1.5sn, Arama (Q) durumunda 3sn hareketsizlik sıkışma sayılır
+                stuck_threshold = 1.5 if self.last_state == "MOVING_TO_METIN" else 3.0
+                
+                # Sadece bir şey yapmaya çalışırken (Gidiyor/Arıyor) ve 1.5-3sn hareketsizse
+                is_really_stuck = (self.static_duration > stuck_threshold) and \
+                                 (not self.is_rotating) and \
+                                 (self.last_state in ["MOVING_TO_METIN", "EXPANDING_SEARCH_Q"])
+
+                if is_really_stuck and self.autopilot and (now > self.stuck_cooldown):
+                    self.smart_log("SIKIŞMA TESPİT EDİLDİ")
+                    recovery_keys = ['space', 'w', 'a', 's', 'd', '3']
+                    key = recovery_keys[self.stuck_retry_count % len(recovery_keys)]
+                    self.smart_log(f"{key.upper()} DENENİYOR")
                     
-                if not is_static: self.stuck_retry_count = 0
-
-                # 2. HEDEF VE SALDIRI DURUMU
-                # is_enemy_dead: 1 (Canlı), 2 (Ölü), 0 (Yok)
-                if self.is_enemy_dead == 1:
-                    if self.mem_is_attacking == 1:
-                        if self.last_state != "ATTACKING":
-                            self.update_log.emit("⚔️ Metin Kesiliyor...")
-                            self.last_state = "ATTACKING"
+                    if key == 'space': pydirectinput.press('space')
+                    elif key == '3': pydirectinput.press('3')
                     else:
-                        if self.last_state != "MOVING_TO_METIN":
-                            self.update_log.emit("🏃 Metne Gidiliyor...")
-                            self.last_state = "MOVING_TO_METIN"
-                elif self.is_enemy_dead == 2 and self.last_state == "ATTACKING":
-                    self.update_log.emit("💎 [METİN KESİLDİ!] - Yeni hedef aranıyor...")
-                    self.last_state = "IDLE"; self.is_enemy_dead = 0; self.last_action_time = now
-                elif (self.last_state == "MOVING_TO_METIN") and (self.sel_vid == 0) and (now - self.last_action_time > 5.0):
-                    # Seçim zaman aşımı (Vazgeç ve aramaya dön)
-                    self.update_log.emit("⚠️ Hedef seçilemedi (Zaman Aşımı), aramaya geçiliyor.")
-                    self.last_state = "IDLE"; self.last_action_time = now
-                elif self.last_state == "ATTACKING" and self.is_enemy_dead == 0:
-                    # Hedef tamamen silindiyse
-                    self.update_log.emit("✅ Hedef kayboldu, aramaya geçiliyor.")
-                    self.last_state = "IDLE"; self.last_action_time = now
+                        pydirectinput.keyDown(key); time.sleep(0.5); pydirectinput.keyUp(key)
+                    
+                    self.stuck_retry_count += 1
+                    self.stuck_cooldown = now + 1.2
+                    self.static_duration = 0.0 # Sayaç sıfırla ki peş peşe basmasın
+                    continue
+
+                if not is_static:
+                    if self.stuck_retry_count > 0:
+                        self.smart_log("KOORDİNAT DEĞİŞTİ, SIKIŞMADAN KURTULUNDU")
+                        self.stuck_retry_count = 0
+
+                # 3. DURUM MAKİNESİ (LOG VE STATE TAKİBİ)
                 
-                # 3. HAREKET VE ARAMA (SADECE ŞARTLAR SAĞLANDIĞINDA)
-                # 🛡️ SİZİN ŞARTLARINIZ: SelVID=0, AtkVID=0, IDLE ve Düşman Ölü/Yok ise ara
+                # A. SALDIRI DOĞRULAMA (DEBOUNCE)
+                # SADECE 'atk_vid > 0' iken (UI'daki 'SALDIRIYOR' şartıyla aynı)
+                if self.last_state == "MOVING_TO_METIN" and (self.mem_is_attacking == 1) and (self.atk_vid > 0):
+                    self.atk_confirm_count += 1
+                else:
+                    self.atk_confirm_count = 0
+
+                # B. SALDIRI BAŞLAMA KONTROLÜ (VARILDI KESİLİYOR)
+                # Şartlar: Yoldayken + Sayaç dolmuşsa (En az 10 döngü) + Kurtarma anında değilsek
+                if self.last_state == "MOVING_TO_METIN" and self.atk_confirm_count > 9 and (now > self.stuck_cooldown):
+                    self.smart_log("METNE VARILDI KESİLİYOR")
+                    self.last_state = "ATTACKING"
+
+                # B. METİN KESİLME KONTROLÜ
+                # Şartlar: Ölü düşman tespiti (2) + IDs temizlenmiş + Öncesinde saldırıyorsak
+                is_done = (self.is_enemy_dead == 2) and (self.sel_vid == 0) and (self.atk_vid == 0)
+                if is_done and self.last_state == "ATTACKING":
+                    self.smart_log("METİN KESİLDİ")
+                    self.last_state = "IDLE"
+                    self.last_action_time = now
+
+                # C. ARAMA VE GİTME MANTIĞI
                 can_search = (self.sel_vid == 0) and (self.atk_vid == 0) and \
                              (self.last_state == "IDLE") and (self.is_enemy_dead in [0, 2])
 
                 if can_search:
                     if not is_empty:
-                        # Hedef varsa rotasyonu DURDUR ve TIKLA
+                        # YOLO BİR ŞEY GÖRDÜ
+                        self.smart_log("METİN BULUNDU")
+                        
                         if self.is_rotating: 
                             for k in ['q', 't', 'g']: pydirectinput.keyUp(k)
                             self.is_rotating = False
@@ -245,43 +285,57 @@ class BotWorker(QThread):
                         abs_x, abs_y = int(tx + monitor["left"]), int(ty + monitor["top"])
                         ctypes.windll.user32.SetCursorPos(abs_x, abs_y)
                         
-                        pydirectinput.press('space') # Dur
+                        pydirectinput.press('space')
                         time.sleep(0.08)
                         ctypes.windll.user32.mouse_event(8, 0, 0, 0, 0) # Right Down
                         time.sleep(0.08)
                         ctypes.windll.user32.mouse_event(16, 0, 0, 0, 0) # Right Up
-                        self.last_action_time = now; self.last_state = "MOVING_TO_METIN"
-                        self.update_log.emit(f"🎯 Yeni Hedef (Sağ Tık): ({abs_x}, {abs_y})")
+                        
+                        self.smart_log("METNE GİDİLİYOR")
+                        self.last_state = "MOVING_TO_METIN"
+                        self.last_action_time = now
+                        self.static_duration = 0.0 # Hareket başladığı an sayacı sıfırla!
+                        self.stuck_retry_count = 0
                     else:
-                        # Tamamen boşsa rotasyonla ara
+                        # Metin yok, aranıyor
+                        self.smart_log("METİN ARANIYOR")
                         if not self.is_rotating:
-                            self.is_rotating = True; self.rotation_start_time = now
+                            self.is_rotating = True
+                            self.rotation_start_time = now
+                            self.smart_log("METİN BULUNAMADI Q İLE ARAMA GENİŞLETİLİYOR")
+                            self.static_duration = 0.0 # Rotasyon başladığı an sayacı sıfırla!
                             pydirectinput.keyDown('q')
-                        elif now - self.rotation_start_time > 10.0: # 10 saniyeden fazla dönüyorsa dur
-                            self.is_rotating = False
+                        elif now - self.rotation_start_time > 12.0:
+                            # 12 saniye döndü hala yok. Biraz ilerle ki yer değişsin.
                             pydirectinput.keyUp('q')
+                            self.is_rotating = False
+                            self.smart_log("ARAMA GENİŞLETİLDİ AMA BULUNAMADI, YER DEĞİŞTİRİLİYOR (W)")
+                            pydirectinput.keyDown('w')
+                            time.sleep(1.0)
+                            pydirectinput.keyUp('w')
+                            self.last_action_time = now
+                            self.rotation_start_time = now # Reset timer
                 else:
-                    # Şartlar sağlanmıyorsa (Zaten işimiz varsa) sadece Takip/Re-click
+                    # Görev var (Gidiyor veya Kesiyor)
                     if not is_empty and self.last_state == "MOVING_TO_METIN":
                         tx, ty = targets[0]
                         abs_x, abs_y = int(tx + monitor["left"]), int(ty + monitor["top"])
                         ctypes.windll.user32.SetCursorPos(abs_x, abs_y)
                         
-                        # Eğer çok beklediysek (Re-click)
-                        is_purgatory = (self.sel_vid == 0) and (now - self.last_action_time > 1.5)
-                        if is_purgatory and is_static:
-                            time.sleep(0.02)
+                        # Re-click logic (Eğer yolda takıldıysa ve IDLE'a düşmemişse)
+                        if (self.sel_vid == 0) and (now - self.last_action_time > 2.0):
                             ctypes.windll.user32.mouse_event(8, 0, 0, 0, 0)
                             time.sleep(0.08)
                             ctypes.windll.user32.mouse_event(16, 0, 0, 0, 0)
                             self.last_action_time = now
-                            self.update_log.emit("🔄 Sağ tık yenileniyor...")
+                            self.smart_log("METNE GİDİLİYOR (Yeniden Seçildi)")
+                            self.static_duration = 0.0 # Yeniden seçimde sayacı sıfırla!
                     
-                    # Eğer bir işimiz varsa ve dönüyorsak, rotasyonu durdur
                     if self.is_rotating:
                         for k in ['q', 't', 'g']: pydirectinput.keyUp(k)
                         self.is_rotating = False
 
+                self.last_frame_time = now
                 self.last_x = self.curr_x
 
     def stop(self):
@@ -372,8 +426,10 @@ class ModernBotUI(QMainWindow):
         ctrl_panel.addWidget(self.start_btn); ctrl_panel.addWidget(self.stop_btn)
         
         self.preview_window = PreviewWindow()
+        self.preview_window.hide() # Kesinlikle kapalı başla
+        
         self.show_preview_cb = QCheckBox("Görüntüyü Göster (Yeni Pencere)")
-        self.show_preview_cb.setChecked(False) # 🚀 KESİN İŞARETSİZ BAŞLAT
+        self.show_preview_cb.setChecked(False) 
         self.show_preview_cb.stateChanged.connect(self.toggle_preview)
         ctrl_panel.addWidget(self.show_preview_cb); mid_layout.addLayout(ctrl_panel)
         main_layout.addLayout(mid_layout)
@@ -399,7 +455,13 @@ class ModernBotUI(QMainWindow):
         self.on_update_log(f"📺 Önizleme: {'AÇIK' if show else 'KAPALI'}")
 
     def on_update_frame(self, f): pass # Artık PreviewWindow kullanıyor
-    def on_update_log(self, m): self.log.append(f"[{time.strftime('%H:%M:%S')}] {m}")
+    def on_update_log(self, m):
+        # Eğer log metni '[' ile başlıyorsa zaten formatlıdır (Dashboard mesajları)
+        # Değilse tarih ekleyerek en tepeye (veya sona) yaz.
+        # Kullanıcının isteği üzerine logu çok biriktirmeyelim
+        if self.log.document().blockCount() > 50:
+            self.log.clear()
+        self.log.append(f"[{time.strftime('%H:%M:%S')}] {m}")
     def on_update_data(self, x, y, atk, name, sel_vid, atk_vid, enemy_dead, fov):
         self.hud_x.setText(f"X: {x:.2f}"); self.hud_y.setText(f"Y: {y:.2f}")
         self.hud_atk.setText(f"ATK: {int(atk)}")
