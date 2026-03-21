@@ -82,3 +82,25 @@ class MemoryHelper:
             return True
         except:
             return False
+
+    # --- KOLAY YAZMA METOTLARI ---
+    def write_float(self, address, value):
+        """Belleğe float değeri yazar."""
+        try:
+            self.pm.write_float(address, float(value))
+            return True
+        except: return False
+
+    def write_int(self, address, value):
+        """Belleğe integer değeri yazar."""
+        try:
+            self.pm.write_int(address, int(value))
+            return True
+        except: return False
+
+    def write_uint(self, address, value):
+        """Belleğe unsigned integer değeri yazar."""
+        try:
+            self.pm.write_uint(address, int(value))
+            return True
+        except: return False
