@@ -31,7 +31,7 @@ except Exception:
 class BotWorker(QThread):
     update_frame = pyqtSignal(np.ndarray)
     update_log = pyqtSignal(str)
-    update_data = pyqtSignal(float, float, float, float, str, bool, int) # X, Y, HP, ATK, Name, BarOnScreen, VID
+    update_data = pyqtSignal(float, float, float, float, str, bool, int, int) # X, Y, HP, ATK, Name, BarOnScreen, VID, EnemyDead
 
     def __init__(self, model_path):
         super().__init__()
@@ -61,11 +61,13 @@ class BotWorker(QThread):
         self.is_bar_on_screen = False 
         self.target_vid = 0 # Saldırılan hedefin VID adresi
         self.conf_threshold = 0.60 # Varsayılan güven eşiği: %60
+        self.is_enemy_dead = 0 # 0: Yok, 1: Canlı, 2: Ölü
         self.template = cv2.imread("search_for.png") if os.path.exists("search_for.png") else None
         
         # Zamanlayıcılar
         self.last_f_time = time.time()
         self.f_state = False # False: Bırakıldı, True: Basıldı
+        self.last_ui_time = 0.0 # UI güncelleme zamanlayıcısı
 
     def _memory_scanner(self):
         """Kütüphane (MemoryHelper) Destekli Bellek Tarayıcı"""
@@ -108,10 +110,10 @@ class BotWorker(QThread):
                 else: 
                     self.is_bar_on_screen = False
                 
-                # 7. Attack Target VID ([Base+039103B8]+4C)
-                ptr_vid = helper.resolve_pointer(0x039103B8, [0x4C])
-                if ptr_vid: self.target_vid = helper.read_uint(ptr_vid)
-                else: self.target_vid = 0
+                # 8. isEnemyDead ([Base+039171A8]+6C0)
+                ptr_dead = helper.resolve_pointer(0x039171A8, [0x6C0])
+                if ptr_dead: self.is_enemy_dead = helper.read_uint(ptr_dead)
+                else: self.is_enemy_dead = 0
             except: pass
             time.sleep(0.01)
 
@@ -125,12 +127,17 @@ class BotWorker(QThread):
             monitor = sct.monitors[1]
             while self.running:
                 now = time.time()
-                self.update_data.emit(self.curr_x, self.curr_y, float(self.curr_hp), float(self.mem_is_attacking), self.curr_name, self.is_bar_on_screen, self.target_vid)
-
-                sct_img = sct.grab(monitor)
-                frame = np.ascontiguousarray(np.array(sct_img)[:, :, :3])
                 
-                # YOLO & BOT MANTIĞI (imgsz=640)
+                # --- ACİL DURDURMA (F10 - Global) ---
+                if ctypes.windll.user32.GetAsyncKeyState(0x79): # F10 tuşu
+                    if self.autopilot:
+                        self.autopilot = False
+                        self.update_log.emit("🛑 ACİL DURDURMA: Otonom Pilot kapatıldı.")
+                
+                sct_img = sct.grab(monitor)
+                frame = np.frombuffer(sct_img.bgra, dtype=np.uint8).reshape(sct_img.height, sct_img.width, 4)
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                
                 results = self.model(frame, conf=self.conf_threshold, device='0', half=True, imgsz=640, verbose=False)
                 targets = []
                 for r in results:
@@ -138,26 +145,78 @@ class BotWorker(QThread):
                         x1, y1, x2, y2 = box.xyxy[0]
                         cx, cy_mid = int((x1+x2)/2), int((y1+y2)/2)
                         targets.append((cx, cy_mid))
-                        # ESKİ KLASİK KIRMIZI ÇEMBER
                         cv2.circle(frame, (cx, cy_mid), int(max(x2-x1, y2-y1)/1.6), (0, 0, 255), 2)
-                        cv2.putText(frame, f"METIN %{box.conf[0]*100:.0f}", (int(x1), int(y1-10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-                # GECİKMESİZ TAKİP (Debug için her zaman aktif)
-                if len(targets) > 0:
-                    tx, ty = targets[0]
-                    abs_x, abs_y = int(tx + monitor["left"]), int(ty + monitor["top"])
-                    ctypes.windll.user32.SetCursorPos(abs_x, abs_y)
-
-                self.update_frame.emit(frame)
-                self.update_data.emit(self.curr_x, self.curr_y, float(self.curr_hp), float(self.mem_is_attacking), self.curr_name, self.is_bar_on_screen, self.target_vid)
+                # UI GÜNCELLEME
+                if now - self.last_ui_time > 0.04:
+                    self.update_frame.emit(frame)
+                    self.update_data.emit(self.curr_x, self.curr_y, float(self.curr_hp), float(self.mem_is_attacking), self.curr_name, self.is_bar_on_screen, self.target_vid, self.is_enemy_dead)
+                    self.last_ui_time = now
                 
                 if not self.autopilot:
                     for k in ['f', 'q', 't', 'g']: pydirectinput.keyUp(k)
                     time.sleep(0.01); continue
                 
-                # OTONOM MOD (Kapalı olduğu için bu kısımlar şu an çalışmaz)
+                # --- OTONOM BOT MANTIĞI ---
                 is_empty = len(targets) == 0
                 is_static = abs(self.curr_x - self.last_x) < 0.001
+
+                # 1. STUCK RECOVERY (Mücadele Öncelikli)
+                if (self.last_state in ["MOVING_TO_METIN", "MOVING"]) and is_static and (now - self.last_action_time > 2.5):
+                    actions = ['space', 's', 'a', 'd']
+                    key = actions[self.stuck_retry_count % len(actions)]
+                    self.update_log.emit(f"⚠️ Engel! Hamle: {key.upper()}")
+                    pydirectinput.keyDown(key); time.sleep(0.5); pydirectinput.keyUp(key)
+                    pydirectinput.press('3'); self.stuck_retry_count += 1
+                    self.last_action_time = now; self.last_state = "IDLE"; continue
+                    
+                if not is_static: self.stuck_retry_count = 0
+
+                # 2. HEDEF VE SALDIRI DURUMU
+                # is_enemy_dead: 1 (Canlı), 2 (Ölü), 0 (Yok)
+                if self.is_enemy_dead == 1:
+                    if self.mem_is_attacking == 1:
+                        if self.last_state != "ATTACKING":
+                            self.update_log.emit("⚔️ Metin Kesiliyor...")
+                            self.last_state = "ATTACKING"
+                    else:
+                        if self.last_state != "MOVING_TO_METIN":
+                            self.update_log.emit("🏃 Metne Gidiliyor...")
+                            self.last_state = "MOVING_TO_METIN"
+                elif self.is_enemy_dead == 2 or (not self.is_bar_on_screen and self.last_state == "ATTACKING"):
+                    self.update_log.emit("✅ Metin bitti, yeni hedef aranıyor")
+                    self.last_state = "IDLE"; self.is_enemy_dead = 0
+                
+                # 3. HAREKET VE ARAMA
+                if self.last_state == "IDLE" or is_empty:
+                    if is_empty:
+                        if not self.is_rotating:
+                            pydirectinput.keyDown('q'); self.is_rotating = True; self.rotation_start_time = now
+                        
+                        search_cycle = (now - self.rotation_start_time) % 4.0
+                        if search_cycle < 2.0: pydirectinput.keyDown('t'); pydirectinput.keyUp('g')
+                        else: pydirectinput.keyDown('g'); pydirectinput.keyUp('t')
+
+                        if now - self.rotation_start_time > 12:
+                            pydirectinput.keyUp('q'); pydirectinput.keyUp('t'); pydirectinput.keyUp('g'); self.is_rotating = False
+                    else:
+                        if self.is_rotating: 
+                            for k in ['q', 't', 'g']: pydirectinput.keyUp(k)
+                            self.is_rotating = False
+                        
+                        tx, ty = targets[0]
+                        abs_x, abs_y = int(tx + monitor["left"]), int(ty + monitor["top"])
+                        pydirectinput.press('space') # Dur
+                        ctypes.windll.user32.SetCursorPos(abs_x, abs_y)
+                        time.sleep(0.1); pydirectinput.click()
+                        self.last_action_time = now; self.last_state = "MOVING_TO_METIN"; self.update_log.emit(f"🎯 Hedef: ({abs_x}, {abs_y})")
+
+                # 4. F DÖNGÜSÜ (Toplama)
+                if not self.f_state and (now - self.last_f_time > 0.1):
+                    pydirectinput.keyDown('f'); self.f_state = True; self.last_f_time = now
+                elif self.f_state and (now - self.last_f_time > 1.0):
+                    pydirectinput.keyUp('f'); self.f_state = False; self.last_f_time = now
+
                 self.last_hp = self.curr_hp; self.last_x = self.curr_x
 
     def stop(self):
@@ -185,6 +244,7 @@ class ModernBotUI(QMainWindow):
         self.hud_bar = QLabel("Hedef Barı: KAPALI"); left.addWidget(self.hud_bar)
         self.hud_vid = QLabel("Hedef VID: 0"); left.addWidget(self.hud_vid)
         self.hud_status = QLabel("Durum: BEKLEMEDE"); left.addWidget(self.hud_status)
+        self.hud_enemy = QLabel("Düşman: SEÇİLMEDİ"); left.addWidget(self.hud_enemy)
 
         # Confidence Ayarı
         left.addWidget(QLabel("Confidence (Güven) Ayarı:"))
@@ -218,13 +278,21 @@ class ModernBotUI(QMainWindow):
         q_img = QImage(cv2.cvtColor(f, cv2.COLOR_BGR2RGB).data, f.shape[1], f.shape[0], f.shape[1]*3, QImage.Format.Format_RGB888)
         self.radar.setPixmap(QPixmap.fromImage(q_img).scaled(self.radar.width(), self.radar.height(), Qt.AspectRatioMode.KeepAspectRatio))
     def on_update_log(self, m): self.log.append(f"[{time.strftime('%H:%M:%S')}] {m}")
-    def on_update_data(self, x, y, hp, atk, name, is_bar, vid):
+    def on_update_data(self, x, y, hp, atk, name, is_bar, vid, enemy_dead):
         self.hud_x.setText(f"X: {x:.2f}")
         self.hud_y.setText(f"Y: {y:.2f}")
         self.hud_hp.setText(f"HP: {int(hp)}")
         self.hud_atk.setText(f"ATK: {int(atk)}")
         self.hud_vid.setText(f"Hedef VID: {vid}")
         
+        # Düşman Durumu (0: Boş, 1: Canlı, 2: Ölü)
+        if enemy_dead == 1:
+            self.hud_enemy.setText("Düşman: CANLI 🛡️"); self.hud_enemy.setStyleSheet("color: #22c55e;")
+        elif enemy_dead == 2:
+            self.hud_enemy.setText("Düşman: ÖLDÜ 💀"); self.hud_enemy.setStyleSheet("color: #ef4444; font-weight: bold;")
+        else:
+            self.hud_enemy.setText("Düşman: SEÇİLMEDİ"); self.hud_enemy.setStyleSheet("color: #94a3b8;")
+
         if vid > 0:
             self.hud_status.setText("Durum: SALDIRIYOR"); self.hud_status.setStyleSheet("color: #22c55e; font-weight: bold;")
         else:
