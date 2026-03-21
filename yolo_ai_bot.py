@@ -3,6 +3,7 @@ import os
 import json
 import time
 import threading
+from collections import deque
 import numpy as np
 import mss
 import cv2
@@ -74,8 +75,9 @@ class BotWorker(QThread):
         self.search_start_time = 0.0
         self.stuck_cooldown = 0.0
         self.atk_confirm_count = 0
-        self.static_duration = 0.0
         self.last_frame_time = time.time()
+        # Sıkışma: MOVING iken son 1 sn örnekleri (titreme / tek kare yanılsamasına dayanıklı)
+        self._move_pos_samples = deque()
 
     def smart_log(self, msg):
         """Aynı logun tekrar etmesini önleyerek temiz çıktı sağlar."""
@@ -136,10 +138,13 @@ class BotWorker(QThread):
                 # 6. Attack VID ([0x039103B8]+0x4C) - HAM VERİ OKUMA
                 ptr_atk_target = self.helper.resolve_pointer(0x039103B8, [0x4C])
                 if ptr_atk_target: 
-                    # 🚀 Hayalet Saldırı: Sadece canlı metne seçiliysek hafızaya YAZ
-                    if self.autopilot and self.sel_vid > 0 and self.is_enemy_dead == 1:
+                    # 🚀 Hayalet Saldırı: sel → atk (canlı metin; yolculukta dead bayrağı gecikirse yine eşitle)
+                    if self.autopilot and self.sel_vid > 0:
                         if self.helper.read_uint(ptr_atk_target) != self.sel_vid:
-                            self.helper.write_uint(ptr_atk_target, self.sel_vid)
+                            if self.is_enemy_dead == 1 or (
+                                self.last_state == "MOVING_TO_METIN" and self.is_enemy_dead != 2
+                            ):
+                                self.helper.write_uint(ptr_atk_target, self.sel_vid)
                     
                     # 🎯 SON DURUMU HER ZAMAN OKU (Filtresiz)
                     self.atk_vid = self.helper.read_uint(ptr_atk_target)
@@ -208,39 +213,56 @@ class BotWorker(QThread):
                     time.sleep(0.01); continue
                 
                 # --- OTONOM BOT MANTIĞI ---
-                # 1. HAREKETLİLİK VE SIKIŞMA TAKİBİ
-                is_static = abs(self.curr_x - self.last_x) < 0.01 # Hassasiyeti biraz düşürdük
-                if is_static:
-                    self.static_duration += (now - self.last_frame_time)
+                # 1. SIKIŞMA: Sağ tık sonrası sel→atk atanana kadar yolculuk başlamış sayılmaz (atk_vid==0 iken sıkışma yok).
+                # atk_vid>0 iken metne gidişte son 1 sn'de (x,y) 2 ondalıkta oynamıyorsa sıkışma.
+                MOVE_STUCK_WINDOW_SEC = 1.0
+                MOVE_STUCK_MAX_DRIFT = 0.01  # 2 ondalık grid: anlamlı adım 0.01; altı titreme sayılmaz
+                qx = round(self.curr_x, 2)
+                qy = round(self.curr_y, 2)
+                is_pos_static = (qx == round(self.last_x, 2) and qy == round(self.last_y, 2))
+                if self.last_state == "MOVING_TO_METIN" and self.atk_vid > 0:
+                    self._move_pos_samples.append((now, qx, qy))
+                    while self._move_pos_samples and (now - self._move_pos_samples[0][0]) > MOVE_STUCK_WINDOW_SEC:
+                        self._move_pos_samples.popleft()
                 else:
-                    self.static_duration = 0.0
-                
-                # 2. STUCK RECOVERY (HEDEF VARKEN HAREKET EDEMEME)
-                # 'Gidiliyor' durumunda 1.5sn, Arama (Q) durumunda 3sn hareketsizlik sıkışma sayılır
-                stuck_threshold = 1.5 if self.last_state == "MOVING_TO_METIN" else 3.0
-                
-                # Sadece bir şey yapmaya çalışırken (Gidiyor/Arıyor) ve 1.5-3sn hareketsizse
-                is_really_stuck = (self.static_duration > stuck_threshold) and \
-                                 (not self.is_rotating) and \
-                                 (self.last_state in ["MOVING_TO_METIN", "EXPANDING_SEARCH_Q"])
+                    self._move_pos_samples.clear()
+
+                is_really_stuck = False
+                if (
+                    self.last_state == "MOVING_TO_METIN"
+                    and self.atk_vid > 0
+                    and (not self.is_rotating)
+                    and len(self._move_pos_samples) >= 2
+                ):
+                    oldest_t = self._move_pos_samples[0][0]
+                    if (now - oldest_t) >= MOVE_STUCK_WINDOW_SEC * 0.92:
+                        xs = [p[1] for p in self._move_pos_samples]
+                        ys = [p[2] for p in self._move_pos_samples]
+                        if (
+                            (max(xs) - min(xs)) < MOVE_STUCK_MAX_DRIFT
+                            and (max(ys) - min(ys)) < MOVE_STUCK_MAX_DRIFT
+                        ):
+                            is_really_stuck = True
 
                 if is_really_stuck and self.autopilot and (now > self.stuck_cooldown):
-                    self.smart_log("SIKIŞMA TESPİT EDİLDİ")
-                    recovery_keys = ['space', 'w', 'a', 's', 'd', '3']
-                    key = recovery_keys[self.stuck_retry_count % len(recovery_keys)]
-                    self.smart_log(f"{key.upper()} DENENİYOR")
-                    
-                    if key == 'space': pydirectinput.press('space')
-                    elif key == '3': pydirectinput.press('3')
+                    recovery_keys = ['w', 'a', 's', 'd', '3']
+                    ki = self.stuck_retry_count % len(recovery_keys)
+                    key = recovery_keys[ki]
+                    # smart_log tekrarlayan satırları susturur; kurtarma her denemede görünsün diye doğrudan emit
+                    self.update_log.emit(
+                        f"SIKIŞMA TESPİT EDİLDİ → {key.upper()} (sıra {ki + 1}/{len(recovery_keys)}, deneme #{self.stuck_retry_count + 1})"
+                    )
+                    if key == '3':
+                        pydirectinput.press('3')
                     else:
                         pydirectinput.keyDown(key); time.sleep(0.5); pydirectinput.keyUp(key)
                     
                     self.stuck_retry_count += 1
                     self.stuck_cooldown = now + 1.2
-                    self.static_duration = 0.0 # Sayaç sıfırla ki peş peşe basmasın
+                    self._move_pos_samples.clear()
                     continue
 
-                if not is_static:
+                if not is_pos_static:
                     if self.stuck_retry_count > 0:
                         self.smart_log("KOORDİNAT DEĞİŞTİ, SIKIŞMADAN KURTULUNDU")
                         self.stuck_retry_count = 0
@@ -260,13 +282,27 @@ class BotWorker(QThread):
                     self.smart_log("METNE VARILDI KESİLİYOR")
                     self.last_state = "ATTACKING"
 
-                # B. METİN KESİLME KONTROLÜ
+                # B. SEÇİM DOĞRULAMA (SELECTING -> MOVING)
+                # Fare ile tıkladıktan sonra hafızaya ID'nin düşmesini bekle
+                if self.last_state == "SELECTING" and self.sel_vid > 0:
+                    self.smart_log(f"METNE GİDİLİYOR (ID: {self.sel_vid})")
+                    self.last_state = "MOVING_TO_METIN"
+                    self.last_action_time = now
+                    self._move_pos_samples.clear()
+                    self._move_pos_samples.append((now, round(self.curr_x, 2), round(self.curr_y, 2)))
+                elif self.last_state == "SELECTING" and (now - self.last_action_time > 3.0):
+                    # 3 saniye geçti hala ID yoksa vazgeç (YOLO tekrar deneyecek)
+                    self.last_state = "IDLE"
+                    self.last_action_time = now
+
+                # C. METİN KESİLME KONTROLÜ
                 # Şartlar: Ölü düşman tespiti (2) + IDs temizlenmiş + Öncesinde saldırıyorsak
                 is_done = (self.is_enemy_dead == 2) and (self.sel_vid == 0) and (self.atk_vid == 0)
                 if is_done and self.last_state == "ATTACKING":
                     self.smart_log("METİN KESİLDİ")
                     self.last_state = "IDLE"
                     self.last_action_time = now
+                    self.stuck_retry_count = 0
 
                 # C. ARAMA VE GİTME MANTIĞI
                 can_search = (self.sel_vid == 0) and (self.atk_vid == 0) and \
@@ -291,10 +327,8 @@ class BotWorker(QThread):
                         time.sleep(0.08)
                         ctypes.windll.user32.mouse_event(16, 0, 0, 0, 0) # Right Up
                         
-                        self.smart_log("METNE GİDİLİYOR")
-                        self.last_state = "MOVING_TO_METIN"
+                        self.last_state = "SELECTING"
                         self.last_action_time = now
-                        self.static_duration = 0.0 # Hareket başladığı an sayacı sıfırla!
                         self.stuck_retry_count = 0
                     else:
                         # Metin yok, aranıyor
@@ -303,7 +337,6 @@ class BotWorker(QThread):
                             self.is_rotating = True
                             self.rotation_start_time = now
                             self.smart_log("METİN BULUNAMADI Q İLE ARAMA GENİŞLETİLİYOR")
-                            self.static_duration = 0.0 # Rotasyon başladığı an sayacı sıfırla!
                             pydirectinput.keyDown('q')
                         elif now - self.rotation_start_time > 12.0:
                             # 12 saniye döndü hala yok. Biraz ilerle ki yer değişsin.
@@ -328,8 +361,8 @@ class BotWorker(QThread):
                             time.sleep(0.08)
                             ctypes.windll.user32.mouse_event(16, 0, 0, 0, 0)
                             self.last_action_time = now
-                            self.smart_log("METNE GİDİLİYOR (Yeniden Seçildi)")
-                            self.static_duration = 0.0 # Yeniden seçimde sayacı sıfırla!
+                            self.last_state = "SELECTING" # Tekrar seçime git
+                            self._move_pos_samples.clear()
                     
                     if self.is_rotating:
                         for k in ['q', 't', 'g']: pydirectinput.keyUp(k)
@@ -337,6 +370,7 @@ class BotWorker(QThread):
 
                 self.last_frame_time = now
                 self.last_x = self.curr_x
+                self.last_y = self.curr_y
 
     def stop(self):
         self.running = False
