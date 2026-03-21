@@ -9,29 +9,32 @@ import cv2
 import pydirectinput
 import ctypes
 from ultralytics import YOLO
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTextEdit, QLineEdit, QFrame, QSlider, QCheckBox
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTextEdit, QLineEdit, QFrame, QSlider, QCheckBox, QGridLayout, QSizePolicy
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QImage, QPixmap
 from memory_helper import MemoryHelper
 
-# --- YÖNETİCİ KONTROLÜ ---
+# --- YÖNETİCİ KONTROLÜ VE GÜVENLİK ---
 def is_admin():
     try: return ctypes.windll.shell32.IsUserAnAdmin()
     except: return False
+
 if not is_admin():
-    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, " ".join(sys.argv), None, 1)
+    # Force Admin Elevation
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{__file__}"', None, 1)
     sys.exit()
 
-# --- DPI FARKINDALIĞI (Hatasız Hedefleme İçin) ---
+pydirectinput.FAILSAFE = False # Kilitleri kapat
 try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(1) # 1: Process_System_DPI_Aware
+    ctypes.windll.shcore.SetProcessDpiAwareness(1)
 except Exception:
-    ctypes.windll.user32.SetProcessDPIAware()
+    try: ctypes.windll.user32.SetProcessDPIAware()
+    except: pass
 
 class BotWorker(QThread):
     update_frame = pyqtSignal(np.ndarray)
     update_log = pyqtSignal(str)
-    update_data = pyqtSignal(float, float, float, float, str, bool, int, int, float) # X, Y, HP, ATK, Name, BarOnScreen, VID, EnemyDead, CurrFov
+    update_data = pyqtSignal(float, float, float, str, int, int, int, float) # X, Y, ATK, Name, SelVID, AtkVID, EnemyDead, CurrFov
 
     def __init__(self, model_path):
         super().__init__()
@@ -43,20 +46,21 @@ class BotWorker(QThread):
         self.is_rotating = False
         self.rotation_start_time = 0.0
         self.stuck_retry_count = 0
-        self.curr_x, self.curr_y, self.curr_hp = 0.0, 0.0, 100
-        self.last_x, self.last_y, self.last_hp = 0.0, 0.0, 100
+        self.curr_x, self.curr_y = 0.0, 0.0
+        self.last_x, self.last_y = 0.0, 0.0
         self.mem_is_attacking = 0
         self.curr_name = "Bağlanıyor..."
         self.new_name_to_write = None
-        self.curr_fov = 2500.0
-        self.target_fov = 2500.0
-        self.auto_fov_enabled = False
-        self.is_bar_on_screen = False 
-        self.target_vid = 0 # Saldırılan hedefin VID adresi
+        self.curr_fov = 10000.0
+        self.target_fov = 10000.0
+        self.auto_fov_enabled = True # Varsayılan: TİKLİ
+        self.sel_vid = 0 # Seçili hedef VID [0x462DC]
+        self.atk_vid = 0 # Saldırılan hedef VID [0x4C]
+        self.locked_vid = 0 # Hedef kaybolunca geri yazılacak ID (Target Lock)
         self.conf_threshold = 0.60 # Varsayılan güven eşiği: %60
         self.is_enemy_dead = 0 # 0: Yok, 1: Canlı, 2: Ölü
         self.max_fov = 10000.0 # Varsayılan Max FOV değeri
-        self.show_preview = False # Performans için varsayılan KAPALI
+        self.show_preview = False # 🚀 KESİN KAPALI BAŞLAT
         self.template = cv2.imread("search_for.png") if os.path.exists("search_for.png") else None
         
         # Zamanlayıcılar
@@ -70,17 +74,13 @@ class BotWorker(QThread):
         """Merkezi self.helper Üzerinden Bellek Tarayıcı"""
         while self.running:
             try:
-                # 1. Koordinat Okuma
-                ptr_pos = self.helper.resolve_pointer(0x0398EF0C, [0x8, 0x20])
+                # 1. Koordinat Okuma (Yeni Pointer: [0x03914B44]+0+0x910)
+                ptr_pos = self.helper.resolve_pointer(0x03914B44, [0, 0x910])
                 if ptr_pos:
                     self.curr_x = self.helper.read_float(ptr_pos)
-                    self.curr_y = self.helper.read_float(ptr_pos + 0x8)
+                    self.curr_y = self.helper.read_float(ptr_pos + 0x4) # Y offset: 0x914 - 0x910 = 0x4
                 
-                # 2. HP Okuma
-                ptr_hp = self.helper.resolve_pointer(0x0398EF0C, [0x8, 0x61C])
-                if ptr_hp: self.curr_hp = self.helper.read_int(ptr_hp)
-                
-                # 3. İsim İşlemleri
+                # 2. İsim İşlemleri
                 ptr_name = self.helper.resolve_pointer(0x03914B3C, [0x14, 0x10])
                 if ptr_name:
                     if self.new_name_to_write:
@@ -88,17 +88,47 @@ class BotWorker(QThread):
                         self.new_name_to_write = None
                     self.curr_name = self.helper.read_string(ptr_name)
                 
-                # 4. Saldırı Durumu
-                ptr_atk = self.helper.resolve_pointer(0x0398EF0C, [0x8, 0x658])
-                if ptr_atk: self.mem_is_attacking = self.helper.read_int(ptr_atk)
+                # 4. Saldırı Durumu (Yeni Pointer: [0x039103F0]+0x10+0x7EC)
+                ptr_atk = self.helper.resolve_pointer(0x039103F0, [0x10, 0x7EC])
+                if ptr_atk: 
+                    atk_val = self.helper.read_int(ptr_atk)
+                    self.mem_is_attacking = 1 if atk_val > 0 else 0
 
-                # 5. Can Barı
-                ptr_bar = self.helper.resolve_pointer(0x0398EF0C, [0x8, 0x6C0])
-                if ptr_bar: self.is_bar_on_screen = (self.helper.read_int(ptr_bar) > 0)
-                
-                # 6. Düşman Durumu (isEnemyDead)
+                # 4. Düşman Durumu (isEnemyDead) - VID İşlemlerinden Önce Okunmalı
                 ptr_dead = self.helper.resolve_pointer(0x039171A8, [0x6C0])
                 if ptr_dead: self.is_enemy_dead = self.helper.read_uint(ptr_dead)
+                
+                # ❗ ÖLÜM KONTROLÜ: Eğer metin öldüyse kilitleri hemen çöz
+                if self.is_enemy_dead == 2:
+                    self.locked_vid = 0; self.sel_vid = 0; self.atk_vid = 0
+
+                # 5. Selected VID ([0x039103C8]+0x462DC)
+                ptr_sel = self.helper.resolve_pointer(0x039103C8, [0x462DC])
+                if ptr_sel: 
+                    v = self.helper.read_uint(ptr_sel)
+                    if v > 0: 
+                        self.sel_vid = v; self.locked_vid = v
+                    elif self.autopilot and self.locked_vid > 0:
+                        # Sadece metin canlıyken kilit yazmaya devam et
+                        if self.is_enemy_dead == 1:
+                            self.helper.write_uint(ptr_sel, self.locked_vid)
+                            time.sleep(0.01)
+                            if self.helper.read_uint(ptr_sel) == 0: self.locked_vid = 0; self.sel_vid = 0
+                            else: self.sel_vid = self.locked_vid
+                        else: self.locked_vid = 0; self.sel_vid = 0
+                    else: self.sel_vid = 0
+
+                # 6. Attack VID ([0x039103B8]+0x4C)
+                ptr_atk_target = self.helper.resolve_pointer(0x039103B8, [0x4C])
+                if ptr_atk_target: 
+                    self.atk_vid = self.helper.read_uint(ptr_atk_target)
+                    # Seçili hedef canlıysa AtkVID'ye yazmaya devam et
+                    if self.autopilot and self.sel_vid > 0 and self.is_enemy_dead == 1:
+                        if self.atk_vid != self.sel_vid:
+                            self.helper.write_uint(ptr_atk_target, self.sel_vid)
+                            self.atk_vid = self.sel_vid
+                    elif self.is_enemy_dead == 2:
+                        self.atk_vid = 0
                 
                 # 7. Anlık FOV (setFov) [[[Base+039195F8]+0]+14]+134
                 ptr_fov_set = self.helper.resolve_pointer(0x039195F8, [0, 0x14, 0x134])
@@ -149,9 +179,8 @@ class BotWorker(QThread):
 
                 # UI GÜNCELLEME
                 if now - self.last_ui_time > 0.04:
-                    if self.show_preview:
-                        self.update_frame.emit(frame)
-                    self.update_data.emit(self.curr_x, self.curr_y, float(self.curr_hp), float(self.mem_is_attacking), self.curr_name, self.is_bar_on_screen, self.target_vid, self.is_enemy_dead, self.curr_fov)
+                    if self.show_preview: self.update_frame.emit(frame)
+                    self.update_data.emit(self.curr_x, self.curr_y, float(self.mem_is_attacking), self.curr_name, self.sel_vid, self.atk_vid, self.is_enemy_dead, self.curr_fov)
                     self.last_ui_time = now
                 
                 if not self.autopilot:
@@ -163,10 +192,14 @@ class BotWorker(QThread):
                 is_static = abs(self.curr_x - self.last_x) < 0.001
 
                 # 1. STUCK RECOVERY (Mücadele Öncelikli)
-                if (self.last_state in ["MOVING_TO_METIN", "MOVING"]) and is_static and (now - self.last_action_time > 2.5):
+                # 🛡️ SİZİN ŞARTINIZ: SelVid!=0, AtkVid!=0, ATK=0, CANLI ve 1 saniyedir hareketsizlik
+                is_really_stuck = is_static and (self.sel_vid != 0) and (self.atk_vid != 0) and \
+                                 (self.mem_is_attacking == 0) and (self.is_enemy_dead == 1)
+                
+                if is_really_stuck and (now - self.last_action_time > 1.0):
                     actions = ['space', 's', 'a', 'd']
                     key = actions[self.stuck_retry_count % len(actions)]
-                    self.update_log.emit(f"⚠️ Engel! Hamle: {key.upper()}")
+                    self.update_log.emit(f"⚠️ Yol Engeli! Hamle: {key.upper()}")
                     pydirectinput.keyDown(key); time.sleep(0.5); pydirectinput.keyUp(key)
                     pydirectinput.press('3'); self.stuck_retry_count += 1
                     self.last_action_time = now; self.last_state = "IDLE"; continue
@@ -184,39 +217,72 @@ class BotWorker(QThread):
                         if self.last_state != "MOVING_TO_METIN":
                             self.update_log.emit("🏃 Metne Gidiliyor...")
                             self.last_state = "MOVING_TO_METIN"
-                elif self.is_enemy_dead == 2 or (not self.is_bar_on_screen and self.last_state == "ATTACKING"):
-                    self.update_log.emit("✅ Metin bitti, yeni hedef aranıyor")
-                    self.last_state = "IDLE"; self.is_enemy_dead = 0
+                elif self.is_enemy_dead == 2 and self.last_state == "ATTACKING":
+                    self.update_log.emit("💎 [METİN KESİLDİ!] - Yeni hedef aranıyor...")
+                    self.last_state = "IDLE"; self.is_enemy_dead = 0; self.last_action_time = now
+                elif (self.last_state == "MOVING_TO_METIN") and (self.sel_vid == 0) and (now - self.last_action_time > 5.0):
+                    # Seçim zaman aşımı (Vazgeç ve aramaya dön)
+                    self.update_log.emit("⚠️ Hedef seçilemedi (Zaman Aşımı), aramaya geçiliyor.")
+                    self.last_state = "IDLE"; self.last_action_time = now
+                elif self.last_state == "ATTACKING" and self.is_enemy_dead == 0:
+                    # Hedef tamamen silindiyse
+                    self.update_log.emit("✅ Hedef kayboldu, aramaya geçiliyor.")
+                    self.last_state = "IDLE"; self.last_action_time = now
                 
-                # 3. HAREKET VE ARAMA
-                if not is_empty:
-                    # Hedef varsa her türlü rotasyonu durdur
-                    if self.is_rotating: 
-                        for k in ['q', 't', 'g']: pydirectinput.keyUp(k)
-                        self.is_rotating = False
-                    
-                    if self.last_state == "IDLE":
-                        tx, ty = targets[0]
-                        abs_x, abs_y = int(tx + monitor["left"]), int(ty + monitor["top"])
-                        pydirectinput.press('space') # Dur
-                        ctypes.windll.user32.SetCursorPos(abs_x, abs_y)
-                        time.sleep(0.1); pydirectinput.click()
-                        self.last_action_time = now; self.last_state = "MOVING_TO_METIN"; self.update_log.emit(f"🎯 Hedef: ({abs_x}, {abs_y})")
-                else:
-                    # Hedef yoksa ve otonomsa arama yap
-                    if self.last_state == "IDLE":
-                        if not self.is_rotating:
-                            pydirectinput.keyDown('q'); self.is_rotating = True; self.rotation_start_time = now
-                        
-                        search_cycle = (now - self.rotation_start_time) % 4.0
-                        if search_cycle < 2.0: pydirectinput.keyDown('t'); pydirectinput.keyUp('g')
-                        else: pydirectinput.keyDown('g'); pydirectinput.keyUp('t')
+                # 3. HAREKET VE ARAMA (SADECE ŞARTLAR SAĞLANDIĞINDA)
+                # 🛡️ SİZİN ŞARTLARINIZ: SelVID=0, AtkVID=0, IDLE ve Düşman Ölü/Yok ise ara
+                can_search = (self.sel_vid == 0) and (self.atk_vid == 0) and \
+                             (self.last_state == "IDLE") and (self.is_enemy_dead in [0, 2])
 
-                        if now - self.rotation_start_time > 12:
+                if can_search:
+                    if not is_empty:
+                        # Hedef varsa rotasyonu DURDUR ve TIKLA
+                        if self.is_rotating: 
                             for k in ['q', 't', 'g']: pydirectinput.keyUp(k)
                             self.is_rotating = False
+                        
+                        tx, ty = targets[0]
+                        abs_x, abs_y = int(tx + monitor["left"]), int(ty + monitor["top"])
+                        ctypes.windll.user32.SetCursorPos(abs_x, abs_y)
+                        
+                        pydirectinput.press('space') # Dur
+                        time.sleep(0.08)
+                        ctypes.windll.user32.mouse_event(8, 0, 0, 0, 0) # Right Down
+                        time.sleep(0.08)
+                        ctypes.windll.user32.mouse_event(16, 0, 0, 0, 0) # Right Up
+                        self.last_action_time = now; self.last_state = "MOVING_TO_METIN"
+                        self.update_log.emit(f"🎯 Yeni Hedef (Sağ Tık): ({abs_x}, {abs_y})")
+                    else:
+                        # Tamamen boşsa rotasyonla ara
+                        if not self.is_rotating:
+                            self.is_rotating = True; self.rotation_start_time = now
+                            pydirectinput.keyDown('q')
+                        elif now - self.rotation_start_time > 10.0: # 10 saniyeden fazla dönüyorsa dur
+                            self.is_rotating = False
+                            pydirectinput.keyUp('q')
+                else:
+                    # Şartlar sağlanmıyorsa (Zaten işimiz varsa) sadece Takip/Re-click
+                    if not is_empty and self.last_state == "MOVING_TO_METIN":
+                        tx, ty = targets[0]
+                        abs_x, abs_y = int(tx + monitor["left"]), int(ty + monitor["top"])
+                        ctypes.windll.user32.SetCursorPos(abs_x, abs_y)
+                        
+                        # Eğer çok beklediysek (Re-click)
+                        is_purgatory = (self.sel_vid == 0) and (now - self.last_action_time > 1.5)
+                        if is_purgatory and is_static:
+                            time.sleep(0.02)
+                            ctypes.windll.user32.mouse_event(8, 0, 0, 0, 0)
+                            time.sleep(0.08)
+                            ctypes.windll.user32.mouse_event(16, 0, 0, 0, 0)
+                            self.last_action_time = now
+                            self.update_log.emit("🔄 Sağ tık yenileniyor...")
+                    
+                    # Eğer bir işimiz varsa ve dönüyorsak, rotasyonu durdur
+                    if self.is_rotating:
+                        for k in ['q', 't', 'g']: pydirectinput.keyUp(k)
+                        self.is_rotating = False
 
-                self.last_hp = self.curr_hp; self.last_x = self.curr_x
+                self.last_x = self.curr_x
 
     def stop(self):
         self.running = False
@@ -237,81 +303,84 @@ class PreviewWindow(QWidget):
         q_img = QImage(cv2.cvtColor(f, cv2.COLOR_BGR2RGB).data, f.shape[1], f.shape[0], f.shape[1]*3, QImage.Format.Format_RGB888)
         self.preview_label.setPixmap(QPixmap.fromImage(q_img).scaled(self.width(), self.height(), Qt.AspectRatioMode.KeepAspectRatio))
 
+
 class ModernBotUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Metin2 YOLO Bot")
-        self.setMinimumSize(340, 800) # Esnek boyutlandırma
-        self.setStyleSheet("QMainWindow { background: #0f172a; } QLabel { color: #cbd5e1; font-size: 11px; } QLineEdit { background: #1e293b; color: white; border: 1px solid #334155; border-radius: 5px; padding: 5px; } QPushButton { background: #22c55e; color: white; font-weight: bold; padding: 10px; border-radius: 8px; } #StopBtn { background: #ef4444; } QTextEdit { background: #000; color: #38bdf8; border-radius: 5px; font-family: 'Consolas'; font-size: 10px; }")
+        self.setWindowTitle("Metin2 YOLO Bot - PRO DASHBOARD")
+        self.setMinimumSize(1000, 750) # Geniş ekran desteği
+        self.setStyleSheet("QMainWindow { background: #0f172a; } QLabel { color: #cbd5e1; font-size: 11px; } QLineEdit { background: #1e293b; color: white; border: 1px solid #334155; border-radius: 5px; padding: 5px; } QPushButton { background: #22c55e; color: white; font-weight: bold; padding: 10px; border-radius: 8px; } #StopBtn { background: #ef4444; } QTextEdit { background: #000; color: #38bdf8; border-radius: 5px; font-family: 'Consolas'; font-size: 11px; }")
 
-        central = QWidget(); self.setCentralWidget(central); layout = QHBoxLayout(central)
-        left = QVBoxLayout(); left_panel = QFrame(); left_panel.setLayout(left); left_panel.setFixedWidth(320)
-        left.addWidget(QLabel("🤖 MEMORY HELPER ACTIVE", styleSheet="font-size: 18px; color: #38bdf8; font-weight: bold;"))
+        central = QWidget(); self.setCentralWidget(central); main_layout = QVBoxLayout(central)
         
-        left.addWidget(QLabel("👤 Karakter İsmi (Değiştirmek için yazıp Enter'a basın):"))
-        self.name_input = QLineEdit("---"); self.name_input.returnPressed.connect(self.change_name)
-        left.addWidget(self.name_input)
+        # --- ÜST BÖLÜM: KARAKTER VE DURUM BİLGİSİ ---
+        top_panel = QFrame(); top_panel.setStyleSheet("background: #1e293b; border-radius: 10px;"); top_layout = QHBoxLayout(top_panel)
         
-        self.hud_x = QLabel("X: 0.00"); left.addWidget(self.hud_x)
-        self.hud_y = QLabel("Y: 0.00"); left.addWidget(self.hud_y)
-        self.hud_hp = QLabel("HP: 0"); left.addWidget(self.hud_hp)
-        self.hud_atk = QLabel("ATK: 0"); left.addWidget(self.hud_atk)
-        self.hud_bar = QLabel("Hedef Barı: KAPALI"); left.addWidget(self.hud_bar)
-        self.hud_vid = QLabel("Hedef VID: 0"); left.addWidget(self.hud_vid)
-        self.hud_status = QLabel("Durum: BEKLEMEDE"); left.addWidget(self.hud_status)
-        self.hud_enemy = QLabel("Düşman: SEÇİLMEDİ"); left.addWidget(self.hud_enemy)
+        # Karakter Bilgileri
+        char_info = QVBoxLayout()
+        helper_title = QLabel("🤖 MEMORY HELPER ACTIVE")
+        helper_title.setStyleSheet("font-size: 16px; color: #38bdf8; font-weight: bold;")
+        char_info.addWidget(helper_title)
+        self.hud_name_label = QLabel("Karakter: ---"); char_info.addWidget(self.hud_name_label)
+        self.name_input = QLineEdit("---"); self.name_input.setFixedWidth(200); self.name_input.returnPressed.connect(self.change_name)
+        char_info.addWidget(self.name_input); top_layout.addLayout(char_info)
         
-        # --- FOV KONTROL PANELI (REDESIGN) ---
-        fov_group = QVBoxLayout()
-        fov_group.setSpacing(10)
+        # Koordinat ve Vuruş
+        stats_layout = QGridLayout()
+        self.hud_x = QLabel("X: 0.00"); stats_layout.addWidget(self.hud_x, 0, 0)
+        self.hud_y = QLabel("Y: 0.00"); stats_layout.addWidget(self.hud_y, 0, 1)
+        self.hud_atk = QLabel("ATK: 0"); stats_layout.addWidget(self.hud_atk, 1, 0, 1, 2)
+        top_layout.addLayout(stats_layout)
         
-        # 1. Max FOV (Limit)
-        max_fov_layout = QHBoxLayout()
-        self.max_fov_input = QLineEdit("10000"); self.max_fov_input.setFixedWidth(60)
-        self.hud_fov_max = QLabel("Mevcut: 10000"); self.hud_fov_max.setStyleSheet("color: #38bdf8;")
-        btn_max_fov = QPushButton("Sınırı Ayarla"); btn_max_fov.setFixedWidth(100); btn_max_fov.setStyleSheet("padding: 5px; font-size: 11px;")
-        btn_max_fov.clicked.connect(self.set_max_fov_manual)
-        max_fov_layout.addWidget(QLabel("Max FOV:")); max_fov_layout.addWidget(self.max_fov_input); max_fov_layout.addWidget(btn_max_fov); max_fov_layout.addWidget(self.hud_fov_max)
-        fov_group.addLayout(max_fov_layout)
+        # Target Bilgileri
+        target_layout = QVBoxLayout()
+        self.hud_sel_vid = QLabel("Seçili VID: 0"); target_layout.addWidget(self.hud_sel_vid)
+        self.hud_atk_vid = QLabel("Saldırı VID: 0"); target_layout.addWidget(self.hud_atk_vid)
+        self.hud_status = QLabel("Durum: BEKLEMEDE"); target_layout.addWidget(self.hud_status)
+        self.hud_enemy = QLabel("Düşman: SEÇİLMEDİ"); target_layout.addWidget(self.hud_enemy)
+        top_layout.addLayout(target_layout); main_layout.addWidget(top_panel)
 
-        # 2. Set FOV (Zoom)
-        set_fov_layout = QHBoxLayout()
-        self.fov_val_input = QLineEdit("2500"); self.fov_val_input.setFixedWidth(60)
-        self.hud_fov_curr = QLabel("Anlık: 2500"); self.hud_fov_curr.setStyleSheet("color: #38bdf8;")
-        self.fov_auto_cb = QCheckBox("Sabitle")
+        # --- ORTA BÖLÜM: AYARLAR VE BUTONLAR ---
+        mid_layout = QHBoxLayout()
+        
+        # FOV Paneli (Sol)
+        fov_panel = QFrame(); fov_panel.setStyleSheet("background: #1e293b; border-radius: 10px;"); fov_v = QVBoxLayout(fov_panel)
+        fov_v.addWidget(QLabel("📸 GÖRÜŞ AÇISI (FOV) AYARLARI", styleSheet="font-weight: bold; color: #38bdf8;"))
+        
+        max_row = QHBoxLayout(); self.max_fov_input = QLineEdit("10000"); self.hud_fov_max = QLabel("Mevcut: 10000")
+        btn_max = QPushButton("Sınır"); btn_max.clicked.connect(self.set_max_fov_manual)
+        max_row.addWidget(QLabel("Max:")); max_row.addWidget(self.max_fov_input); max_row.addWidget(btn_max); max_row.addWidget(self.hud_fov_max)
+        fov_v.addLayout(max_row)
+
+        zoom_row = QHBoxLayout(); self.fov_val_input = QLineEdit("10000"); self.hud_fov_curr = QLabel("Anlık: 10000")
+        btn_zoom = QPushButton("Zoom"); btn_zoom.clicked.connect(self.set_zoom_fov_manual)
+        zoom_row.addWidget(QLabel("Set:")); zoom_row.addWidget(self.fov_val_input); zoom_row.addWidget(btn_zoom); zoom_row.addWidget(self.hud_fov_curr)
+        fov_v.addLayout(zoom_row)
+        
+        self.fov_auto_cb = QCheckBox("Sürekli Sabitle"); self.fov_auto_cb.setChecked(True)
         self.fov_auto_cb.stateChanged.connect(self.toggle_auto_fov)
-        btn_set_fov = QPushButton("Zumu Ayarla"); btn_set_fov.setFixedWidth(100); btn_set_fov.setStyleSheet("padding: 5px; font-size: 11px;")
-        btn_set_fov.clicked.connect(self.set_zoom_fov_manual)
-        set_fov_layout.addWidget(QLabel("Zoom FOV:")); set_fov_layout.addWidget(self.fov_val_input); set_fov_layout.addWidget(btn_set_fov); set_fov_layout.addWidget(self.hud_fov_curr)
-        fov_group.addLayout(set_fov_layout)
-        fov_group.addWidget(self.fov_auto_cb)
+        fov_v.addWidget(self.fov_auto_cb); mid_layout.addWidget(fov_panel)
+
+        # Kontrol Ve Gürüntü (Sağ)
+        ctrl_panel = QVBoxLayout()
+        self.conf_slider = QSlider(Qt.Orientation.Horizontal); self.conf_slider.setRange(5, 95); self.conf_slider.setValue(60)
+        self.conf_label = QLabel("Conf: 0.60"); self.conf_slider.valueChanged.connect(self.update_conf)
+        ctrl_panel.addWidget(self.conf_label); ctrl_panel.addWidget(self.conf_slider)
         
-        left.addLayout(fov_group)
-
-        # Confidence Ayarı
-        left.addWidget(QLabel("Confidence (Güven) Ayarı:"))
-        conf_layout = QHBoxLayout()
-        self.conf_slider = QSlider(Qt.Orientation.Horizontal)
-        self.conf_slider.setRange(5, 95); self.conf_slider.setValue(60)
-        self.conf_label = QLabel("0.60")
-        self.conf_slider.valueChanged.connect(self.update_conf)
-        conf_layout.addWidget(self.conf_slider); conf_layout.addWidget(self.conf_label)
-        left.addLayout(conf_layout)
-
-        left.addStretch()
-        self.start_btn = QPushButton("BAŞLAT"); self.start_btn.clicked.connect(self.start_bot)
-        left.addWidget(self.start_btn)
-        self.stop_btn = QPushButton("DURDUR"); self.stop_btn.setEnabled(False); self.stop_btn.clicked.connect(self.stop_bot)
-        left.addWidget(self.stop_btn)
-
-        # Önizleme Kontrolü
+        self.start_btn = QPushButton("🚀 BAŞLAT (AUTO)"); self.start_btn.clicked.connect(self.start_bot)
+        self.stop_btn = QPushButton("🛑 DURDUR"); self.stop_btn.setEnabled(False); self.stop_btn.setObjectName("StopBtn"); self.stop_btn.clicked.connect(self.stop_bot)
+        ctrl_panel.addWidget(self.start_btn); ctrl_panel.addWidget(self.stop_btn)
+        
         self.preview_window = PreviewWindow()
-        self.show_preview_cb = QCheckBox("Görüntüyü Göster (Ayrı Pencere)")
+        self.show_preview_cb = QCheckBox("Görüntüyü Göster (Yeni Pencere)")
+        self.show_preview_cb.setChecked(False) # 🚀 KESİN İŞARETSİZ BAŞLAT
         self.show_preview_cb.stateChanged.connect(self.toggle_preview)
-        left.addWidget(self.show_preview_cb)
+        ctrl_panel.addWidget(self.show_preview_cb); mid_layout.addLayout(ctrl_panel)
+        main_layout.addLayout(mid_layout)
 
-        self.log = QTextEdit(); self.log.setFixedHeight(120); left.addWidget(self.log)
-        layout.addWidget(left_panel)
+        # --- ALT BÖLÜM: LOGLAR (GENİŞLEYEN) ---
+        self.log = QTextEdit(); self.log.setPlaceholderText("Sistem logları burada görünecek..."); self.log.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        main_layout.addWidget(QLabel("📜 SİSTEM LOGLARI")); main_layout.addWidget(self.log)
 
         self.worker = BotWorker(r"runs\detect\train6\weights\best.pt")
         self.worker.update_frame.connect(self.preview_window.update_image)
@@ -331,10 +400,12 @@ class ModernBotUI(QMainWindow):
 
     def on_update_frame(self, f): pass # Artık PreviewWindow kullanıyor
     def on_update_log(self, m): self.log.append(f"[{time.strftime('%H:%M:%S')}] {m}")
-    def on_update_data(self, x, y, hp, atk, name, is_bar, vid, enemy_dead, fov):
+    def on_update_data(self, x, y, atk, name, sel_vid, atk_vid, enemy_dead, fov):
         self.hud_x.setText(f"X: {x:.2f}"); self.hud_y.setText(f"Y: {y:.2f}")
-        self.hud_hp.setText(f"HP: {int(hp)}"); self.hud_atk.setText(f"ATK: {int(atk)}")
-        self.hud_vid.setText(f"Hedef VID: {vid}")
+        self.hud_atk.setText(f"ATK: {int(atk)}")
+        self.hud_sel_vid.setText(f"Seçili VID: {sel_vid}")
+        self.hud_atk_vid.setText(f"Saldırı VID: {atk_vid}")
+        self.hud_name_label.setText(f"Karakter: {name}")
         self.hud_fov_curr.setText(f"Anlık: {fov:.0f}")
         self.hud_fov_max.setText(f"Mevcut: {self.worker.max_fov:.0f}")
         
@@ -346,15 +417,10 @@ class ModernBotUI(QMainWindow):
         else:
             self.hud_enemy.setText("Düşman: SEÇİLMEDİ"); self.hud_enemy.setStyleSheet("color: #94a3b8;")
 
-        if vid > 0:
+        if (atk_vid > 0) and (atk > 0):
             self.hud_status.setText("Durum: SALDIRIYOR"); self.hud_status.setStyleSheet("color: #22c55e; font-weight: bold;")
         else:
             self.hud_status.setText("Durum: BEKLEMEDE"); self.hud_status.setStyleSheet("color: #94a3b8;")
-            
-        if is_bar:
-            self.hud_bar.setText("Hedef Barı: AÇIK"); self.hud_bar.setStyleSheet("color: #22c55e; font-weight: bold;")
-        else:
-            self.hud_bar.setText("Hedef Barı: KAPALI"); self.hud_bar.setStyleSheet("color: #94a3b8;")
 
     def toggle_auto_fov(self, state):
         enabled = (state == 2)
